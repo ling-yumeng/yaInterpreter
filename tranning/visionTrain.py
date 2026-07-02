@@ -3,27 +3,42 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from transformers import AutoTokenizer
-from model_yavision import yaVisionAligner # 引入你之前写的组装类
+from yaVision import yaVisionAligner  # 引入你之前写的组装类
 
 # ==============================================================================
 # 1. 打造硬核多模态本地数据集载入器 (Dataset)
 # ==============================================================================
 class yaLocalOCRDataset(Dataset):
     """
-    负责从本地读取你的游戏截图和对应的日韩中英歌词/文本标签
+    负责直接读取 TRDG 原生生成的 labels.txt（格式：文件名 文本答案）
+    并加载对应的 <number>.jpg 图片进行多模态特训
     """
     def __init__(self, image_dir, label_file, tokenizer, vision_processor):
         self.image_dir = image_dir
         self.tokenizer = tokenizer
         self.processor = vision_processor
-        
-        # 假设你的 label_file 是一个文本，每行格式为: "image_name.png\t对应识别的文本答案"
         self.data_samples = []
+        
+        if not os.path.exists(label_file):
+            raise FileNotFoundError(f"❌ 未在指定路径找到标签文件: {label_file}")
+            
+        # 直接读取 TRDG 吐出来的 labels.txt
         with open(label_file, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip():
-                    img_name, text = line.strip().split("\t")
-                    self.data_samples.append((img_name, text))
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 核心解析：TRDG 默认使用空格分隔 "<filename> <Texts>"
+                # 使用 maxsplit=1 限制切分次数，防止日文文本内部含空格时导致解析错位
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2:
+                    img_name, target_text = parts[0], parts[1]
+                    # 确保图片在本地真实存在，防止空跑触发文件不存在报警
+                    if os.path.exists(os.path.join(self.image_dir, img_name)):
+                        self.data_samples.append((img_name, target_text))
+                        
+        print(f"📖 成功载入本地特训数据集，共检测到 {len(self.data_samples)} 个有效样本。")
 
     def __len__(self):
         return len(self.data_samples)
@@ -32,33 +47,30 @@ class yaLocalOCRDataset(Dataset):
         img_name, target_text = self.data_samples[idx]
         img_path = os.path.join(self.image_dir, img_name)
         
-        # 1. 载入本地图片并过 SigLIP 预处理器，强制缩放到 384x384 并归一化
+        # 1. 载入本地 .jpg 图片并过 SigLIP 预处理器，强制缩放到 384x384 并归一化
         image = Image.open(img_path).convert("RGB")
         pixel_values = self.processor(images=image, return_tensors="pt").pixel_values.squeeze(0)
         # pixel_values 形状: [3, 384, 384]
 
         # 2. 构造标准的文本输入流
         prompt = "识别图中的所有文字，并给出空间关联:\n"
-        answer = target_text + "\n" # 加上结束符让大模型学会收尾
+        answer = target_text + "\n"  # 加上结束符让大模型学会收尾
         
         prompt_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids
         answer_ids = self.tokenizer(answer, add_special_tokens=False).input_ids
         
-        # 拼接成完整的 input_ids 给大模型做自回归上下文
-        # 形状: [Prompt_Len + Answer_Len]
-        input_ids = torch.tensor(prompt_ids + answer_ids, dtype=torch.long)
-        
         # 3. 核心构建：计算掩码 Labels
         # 视觉 Token 占 576 位，Prompt 占 prompt_ids 位，全部用 -100 屏蔽！
+        # 只有最后真正的日文答案部分才计算真实 CrossEntropyLoss
         labels = torch.cat([
             torch.full((576,), -100, dtype=torch.long),
             torch.full((len(prompt_ids),), -100, dtype=torch.long),
-            torch.tensor(answer_ids, dtype=torch.long) # 只有这里才计算 Loss
+            torch.tensor(answer_ids, dtype=torch.long)
         ])
         
         return {
             "pixel_values": pixel_values,
-            "input_ids": torch.tensor(prompt_ids, dtype=torch.long), # 传给前向拼接的只需要 Prompt 部分
+            "input_ids": torch.tensor(prompt_ids, dtype=torch.long),  # 传给前向拼接的只需要 Prompt 部分
             "labels": labels
         }
 
@@ -69,11 +81,13 @@ def run_local_training():
     # 强制开启完全断网离线炼丹模式，防止 transformers 悄悄联网挂起
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     
-    # 本地路径定义（替换为你真实的本地 safetensors 权重目录）
+    # 本地模型与生成的特训数据集路径定义
     LOCAL_LLM_PATH = "./models/Qwen3.5-4B"
-    LOCAL_VISION_PATH = "./models/siglip-base-patch16-384"
+    LOCAL_VISION_PATH = "./models/siglip2-base-patch16-384"
+    DATASET_DIR = "./ja_corrupted_images"
+    LABEL_FILE_PATH = "./ja_corrupted_images/labels.txt"
     
-    # 1. 初始化模型
+    # 1. 初始化多模态组装模型
     # 第一次运行默认开启纯 GPU 流(use_cpu_vision=False)。如果爆显存，请手动改为 True 触发 CPU 防御流。
     model = yaVisionAligner(
         llm_id=LOCAL_LLM_PATH, 
@@ -81,22 +95,13 @@ def run_local_training():
         use_cpu_vision=False 
     )
     
-    # 2. 初始化分词器和视觉处理器
+    # 2. 初始化分词器
     tokenizer = AutoTokenizer.from_pretrained(LOCAL_LLM_PATH)
     
-    # 3. 准备你本地的数据集（这里假设你已经创建了对应的文件夹和描述文本）
-    # mock 一个本地的 labels.txt。真实开发时请准备好对应的图片和文本
-    if not os.path.exists("./train_data"):
-        print("⚠️ 未检测到本地训练数据目录，正在自动创建样本占位符...")
-        os.makedirs("./train_data/images", exist_ok=True)
-        with open("./train_data/labels.txt", "w") as f:
-            f.write("sample_01.png\t漂泊ノ海 -Wandering Sea-\n")
-        # 随手画一张假图用于跑通测试
-        Image.fromarray(axis=0, obj=None).resize((384,384)).save("./train_data/images/sample_01.png")
-
+    # 3. 准备你本地刚生成的 TRDG 数据集
     dataset = yaLocalOCRDataset(
-        image_dir="./train_data/images",
-        label_file="./train_data/labels.txt",
+        image_dir=DATASET_DIR,
+        label_file=LABEL_FILE_PATH,
         tokenizer=tokenizer,
         vision_processor=model.vision_processor
     )
@@ -140,7 +145,7 @@ def run_local_training():
         save_dir = f"./checkpoints/epoch_{epoch+1}"
         os.makedirs(save_dir, exist_ok=True)
         # 只保存 mmproj 即可，千万别把几 GB 冻结的 Qwen3.5 重新存一遍！
-        torch.save(model.mmproj.state_dict(), os.path.join(save_dir, "mmproj.bin"))
+        torch.save(model.state_dict(), os.path.join(save_dir, "mmproj.bin"))
         print(f"💾 已成功将当前 Epoch 的抽象变换连接件保存至: {save_dir}/mmproj.bin")
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+transformers
+transformers_stream_generator
+accelerate
+sentencepiece
+protobuf
+pillow

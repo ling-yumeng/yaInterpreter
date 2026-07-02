@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 from transformers import AutoProcessor, SiglipVisionModel
+import os
 
 class yaVisionProjector(nn.Module):
     """

@@ -1,0 +1,9 @@
+[submodule "dataset"]
+	path = dataset
+	url = git@github.com:ling-yumeng/yaInterpreter_dataset.git
+[submodule "models/Qwen3.5-4B"]
+	path = models/Qwen3.5-4B
+	url = https://www.modelscope.cn/Qwen/Qwen3.5-4B.git
+[submodule "models/siglip2-base-patch16-384"]
+	path = models/siglip2-base-patch16-384
+	url = https://www.modelscope.cn/google/siglip2-base-patch16-384.git
