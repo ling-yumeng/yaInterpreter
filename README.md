@@ -47,4 +47,4 @@ The entire processing pipeline forms a highly cohesive reactive loop:
 Process
 ===========
 
-1. Tranning mmproj for connection between `siglip2-base-patch16-384 and Qwen3.5-4B`
+1. Tranning mmproj for connection between `siglip2-base-patch16-384` and `Qwen3.5-4B`
