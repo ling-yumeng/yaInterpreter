@@ -1,2 +1,3 @@
 venv
-dataset/generated/venv
+dataset/generated/trdg
+tranning/__pycache__/
